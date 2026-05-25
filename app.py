@@ -1,0 +1,849 @@
+# app.py
+# Proyecto Final - Métodos de Optimización
+# Aplicación Streamlit para minimizar funciones de n variables usando:
+# 1) Gradiente Descendente
+# 2) Gradiente Conjugado no lineal (Fletcher-Reeves)
+# 3) Método de Newton globalizado
+# Todos usan búsqueda de línea con Condiciones de Wolfe.
+
+import time
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
+import sympy as sp
+from sympy.parsing.sympy_parser import (
+    convert_xor,
+    implicit_multiplication_application,
+    parse_expr,
+    standard_transformations,
+)
+
+
+# ============================================================
+# Configuración general
+# ============================================================
+
+st.set_page_config(
+    page_title="Optimizador con Condiciones de Wolfe",
+    page_icon="📉",
+    layout="wide",
+)
+
+EPS = 1e-12
+
+
+# ============================================================
+# Estructuras de datos
+# ============================================================
+
+@dataclass
+class OptimizationResult:
+    method: str
+    x_star: np.ndarray
+    f_star: float
+    iterations: int
+    final_error: float
+    stop_reason: str
+    elapsed_time: float
+    history: pd.DataFrame
+
+
+# ============================================================
+# Utilidades numéricas
+# ============================================================
+
+def format_vector(x: np.ndarray, decimals: int = 8) -> str:
+    """Convierte un vector numpy en texto legible."""
+    return "(" + ", ".join([f"{value:.{decimals}g}" for value in x]) + ")"
+
+
+def safe_float(value) -> float:
+    """Convierte una evaluación simbólica o numérica a float."""
+    value = float(value)
+    if not np.isfinite(value):
+        raise FloatingPointError("La función devolvió un valor no finito.")
+    return value
+
+
+def parse_initial_point(text: str, n: int) -> np.ndarray:
+    """Lee el punto inicial desde texto separado por comas."""
+    try:
+        values = [float(v.strip()) for v in text.split(",") if v.strip() != ""]
+    except Exception as exc:
+        raise ValueError("El punto de partida debe tener números separados por comas. Ejemplo: 2, -1, 0") from exc
+
+    if len(values) != n:
+        raise ValueError(f"El punto de partida debe contener exactamente {n} valores.")
+
+    return np.array(values, dtype=float)
+
+
+def build_sympy_functions(expr_text: str, n: int) -> Tuple[sp.Expr, List[sp.Symbol], Callable, Callable, Callable]:
+    """
+    Construye función objetivo, gradiente y Hessiana desde texto usando SymPy.
+
+    Variables esperadas:
+    x1, x2, ..., xn
+
+    Ejemplos válidos:
+    x1**2 + x2**2
+    (x1-1)^2 + 10*(x2-x1^2)^2
+    exp(x1) + x2^2
+    ln(x1^2 + x2^2) - 2*x1*x2
+    """
+    variables = sp.symbols(f"x1:{n+1}")
+    transformations = standard_transformations + (
+        implicit_multiplication_application,
+        convert_xor,
+    )
+
+    allowed: Dict[str, object] = {
+        "sin": sp.sin,
+        "cos": sp.cos,
+        "tan": sp.tan,
+        "exp": sp.exp,
+        "sqrt": sp.sqrt,
+        "log": sp.log,
+        "ln": sp.log,
+        "pi": sp.pi,
+        "E": sp.E,
+        "abs": sp.Abs,
+    }
+
+    for var in variables:
+        allowed[str(var)] = var
+
+    try:
+        expr = parse_expr(
+            expr_text,
+            local_dict=allowed,
+            transformations=transformations,
+            evaluate=True,
+        )
+    except Exception as exc:
+        raise ValueError(
+            "No se pudo interpretar la función. Usa variables x1, x2, ..., xn. "
+            "Ejemplo: (x1-1)^2 + (x2+2)^2"
+        ) from exc
+
+    free_symbols = expr.free_symbols
+    invalid_symbols = [s for s in free_symbols if s not in set(variables)]
+    if invalid_symbols:
+        raise ValueError(f"La función contiene símbolos no permitidos: {invalid_symbols}")
+
+    grad_expr = [sp.diff(expr, var) for var in variables]
+    hess_expr = sp.Matrix(grad_expr).jacobian(variables)
+
+    f_raw = sp.lambdify(variables, expr, modules=["numpy"])
+    g_raw = sp.lambdify(variables, grad_expr, modules=["numpy"])
+    h_raw = sp.lambdify(variables, hess_expr, modules=["numpy"])
+
+    def f(x: np.ndarray) -> float:
+        return safe_float(f_raw(*x))
+
+    def grad(x: np.ndarray) -> np.ndarray:
+        value = np.array(g_raw(*x), dtype=float).reshape(n)
+        if not np.all(np.isfinite(value)):
+            raise FloatingPointError("El gradiente devolvió valores no finitos.")
+        return value
+
+    def hess(x: np.ndarray) -> np.ndarray:
+        value = np.array(h_raw(*x), dtype=float).reshape(n, n)
+        if not np.all(np.isfinite(value)):
+            raise FloatingPointError("La Hessiana devolvió valores no finitos.")
+        return value
+
+    return expr, list(variables), f, grad, hess
+
+
+# ============================================================
+# Búsqueda de línea con Wolfe
+# ============================================================
+
+def wolfe_line_search(
+    f: Callable[[np.ndarray], float],
+    grad: Callable[[np.ndarray], np.ndarray],
+    x: np.ndarray,
+    p: np.ndarray,
+    c1: float,
+    c2: float,
+    alpha0: float = 1.0,
+    alpha_max: float = 50.0,
+    max_ls_iter: int = 40,
+) -> Tuple[float, str]:
+    """
+    Búsqueda de línea que intenta cumplir Condiciones de Wolfe débiles:
+
+    1) Armijo:
+       f(x + alpha*p) <= f(x) + c1*alpha*grad(x)^T*p
+
+    2) Curvatura:
+       grad(x + alpha*p)^T*p >= c2*grad(x)^T*p
+
+    Requiere que p sea dirección de descenso:
+       grad(x)^T*p < 0
+    """
+    phi0 = f(x)
+    g0 = grad(x)
+    derphi0 = float(np.dot(g0, p))
+
+    if derphi0 >= 0:
+        return 0.0, "La dirección no es de descenso; no se puede aplicar Wolfe."
+
+    def phi(alpha: float) -> float:
+        return f(x + alpha * p)
+
+    def derphi(alpha: float) -> float:
+        return float(np.dot(grad(x + alpha * p), p))
+
+    def zoom(alpha_lo: float, alpha_hi: float) -> Tuple[float, str]:
+        """Fase zoom por bisección dentro de un intervalo que contiene un alpha aceptable."""
+        phi_lo = phi(alpha_lo)
+
+        for _ in range(max_ls_iter):
+            alpha_j = 0.5 * (alpha_lo + alpha_hi)
+
+            if alpha_j <= EPS:
+                return max(alpha_j, EPS), "Zoom llegó a un alpha muy pequeño."
+
+            try:
+                phi_j = phi(alpha_j)
+            except Exception:
+                alpha_hi = alpha_j
+                continue
+
+            if (phi_j > phi0 + c1 * alpha_j * derphi0) or (phi_j >= phi_lo):
+                alpha_hi = alpha_j
+            else:
+                try:
+                    derphi_j = derphi(alpha_j)
+                except Exception:
+                    alpha_hi = alpha_j
+                    continue
+
+                if derphi_j >= c2 * derphi0:
+                    return alpha_j, "Wolfe satisfecho."
+
+                if derphi_j * (alpha_hi - alpha_lo) >= 0:
+                    alpha_hi = alpha_lo
+
+                alpha_lo = alpha_j
+                phi_lo = phi_j
+
+            if abs(alpha_hi - alpha_lo) < EPS:
+                return max(alpha_j, EPS), "Zoom terminó por intervalo muy pequeño."
+
+        return max(0.5 * (alpha_lo + alpha_hi), EPS), "Zoom alcanzó el máximo de iteraciones."
+
+    alpha_prev = 0.0
+    phi_prev = phi0
+    alpha = min(max(alpha0, EPS), alpha_max)
+
+    for i in range(max_ls_iter):
+        try:
+            phi_alpha = phi(alpha)
+        except Exception:
+            alpha = 0.5 * (alpha + alpha_prev)
+            continue
+
+        armijo_rhs = phi0 + c1 * alpha * derphi0
+
+        if (phi_alpha > armijo_rhs) or (i > 0 and phi_alpha >= phi_prev):
+            return zoom(alpha_prev, alpha)
+
+        try:
+            derphi_alpha = derphi(alpha)
+        except Exception:
+            return zoom(alpha_prev, alpha)
+
+        if derphi_alpha >= c2 * derphi0:
+            return alpha, "Wolfe satisfecho."
+
+        if derphi_alpha >= 0:
+            return zoom(alpha, alpha_prev)
+
+        alpha_prev = alpha
+        phi_prev = phi_alpha
+        alpha = min(2.0 * alpha, alpha_max)
+
+    return alpha, "Búsqueda de línea alcanzó el máximo de iteraciones."
+
+
+# ============================================================
+# Algoritmos de optimización
+# ============================================================
+
+def gradient_descent(
+    f: Callable[[np.ndarray], float],
+    grad: Callable[[np.ndarray], np.ndarray],
+    x0: np.ndarray,
+    max_iter: int,
+    tol: float,
+    c1: float,
+    c2: float,
+    alpha0: float,
+) -> OptimizationResult:
+    """Gradiente descendente con búsqueda de línea Wolfe."""
+    start = time.perf_counter()
+    x = x0.astype(float).copy()
+    rows = []
+    stop_reason = "Máximo número de iteraciones alcanzado."
+
+    for k in range(max_iter + 1):
+        fx = f(x)
+        g = grad(x)
+        error = float(np.linalg.norm(g, ord=2))
+
+        rows.append({
+            "iteracion": k,
+            "f(x)": fx,
+            "error_norma_gradiente": error,
+            "alpha": np.nan,
+            "criterio": "Evaluación inicial" if k == 0 else "",
+            **{f"x{i+1}": x[i] for i in range(len(x))}
+        })
+
+        if error <= tol:
+            stop_reason = "Convergencia: norma del gradiente menor o igual a la tolerancia."
+            break
+
+        if k == max_iter:
+            break
+
+        p = -g
+        alpha, ls_msg = wolfe_line_search(f, grad, x, p, c1, c2, alpha0=alpha0)
+
+        if alpha <= EPS:
+            stop_reason = "Parada: la búsqueda de línea no encontró un paso útil."
+            rows[-1]["criterio"] = ls_msg
+            break
+
+        x = x + alpha * p
+        rows[-1]["alpha"] = alpha
+        rows[-1]["criterio"] = ls_msg
+
+    elapsed = time.perf_counter() - start
+    history = pd.DataFrame(rows)
+
+    return OptimizationResult(
+        method="Gradiente Descendente",
+        x_star=x,
+        f_star=f(x),
+        iterations=len(history) - 1,
+        final_error=float(np.linalg.norm(grad(x), ord=2)),
+        stop_reason=stop_reason,
+        elapsed_time=elapsed,
+        history=history,
+    )
+
+
+def conjugate_gradient_fr(
+    f: Callable[[np.ndarray], float],
+    grad: Callable[[np.ndarray], np.ndarray],
+    x0: np.ndarray,
+    max_iter: int,
+    tol: float,
+    c1: float,
+    c2: float,
+    alpha0: float,
+) -> OptimizationResult:
+    """
+    Gradiente conjugado no lineal con fórmula Fletcher-Reeves:
+
+    beta_k = ||g_{k+1}||^2 / ||g_k||^2
+    p_{k+1} = -g_{k+1} + beta_k p_k
+
+    Si la dirección deja de ser de descenso, se reinicia con -gradiente.
+    """
+    start = time.perf_counter()
+    x = x0.astype(float).copy()
+    g = grad(x)
+    p = -g
+    rows = []
+    stop_reason = "Máximo número de iteraciones alcanzado."
+
+    for k in range(max_iter + 1):
+        fx = f(x)
+        error = float(np.linalg.norm(g, ord=2))
+
+        rows.append({
+            "iteracion": k,
+            "f(x)": fx,
+            "error_norma_gradiente": error,
+            "alpha": np.nan,
+            "beta_FR": np.nan,
+            "criterio": "Evaluación inicial" if k == 0 else "",
+            **{f"x{i+1}": x[i] for i in range(len(x))}
+        })
+
+        if error <= tol:
+            stop_reason = "Convergencia: norma del gradiente menor o igual a la tolerancia."
+            break
+
+        if k == max_iter:
+            break
+
+        if float(np.dot(g, p)) >= 0:
+            p = -g
+            rows[-1]["criterio"] = "Reinicio: dirección no descendente."
+
+        alpha, ls_msg = wolfe_line_search(f, grad, x, p, c1, c2, alpha0=alpha0)
+
+        if alpha <= EPS:
+            stop_reason = "Parada: la búsqueda de línea no encontró un paso útil."
+            rows[-1]["criterio"] = ls_msg
+            break
+
+        x_new = x + alpha * p
+        g_new = grad(x_new)
+
+        denom = max(float(np.dot(g, g)), EPS)
+        beta = float(np.dot(g_new, g_new)) / denom
+
+        p_new = -g_new + beta * p
+
+        # Reinicio defensivo para mantener dirección de descenso.
+        if float(np.dot(g_new, p_new)) >= 0:
+            p_new = -g_new
+            beta = 0.0
+            ls_msg += " Reinicio FR por dirección no descendente."
+
+        rows[-1]["alpha"] = alpha
+        rows[-1]["beta_FR"] = beta
+        rows[-1]["criterio"] = ls_msg
+
+        x = x_new
+        g = g_new
+        p = p_new
+
+    elapsed = time.perf_counter() - start
+    history = pd.DataFrame(rows)
+
+    return OptimizationResult(
+        method="Gradiente Conjugado Fletcher-Reeves",
+        x_star=x,
+        f_star=f(x),
+        iterations=len(history) - 1,
+        final_error=float(np.linalg.norm(grad(x), ord=2)),
+        stop_reason=stop_reason,
+        elapsed_time=elapsed,
+        history=history,
+    )
+
+
+def newton_method(
+    f: Callable[[np.ndarray], float],
+    grad: Callable[[np.ndarray], np.ndarray],
+    hess: Callable[[np.ndarray], np.ndarray],
+    x0: np.ndarray,
+    max_iter: int,
+    tol: float,
+    c1: float,
+    c2: float,
+    alpha0: float,
+) -> OptimizationResult:
+    """
+    Método de Newton globalizado con búsqueda de línea Wolfe.
+
+    Dirección ideal:
+        H(x_k) p_k = -grad(x_k)
+
+    Si la Hessiana es singular o la dirección de Newton no es de descenso,
+    se usa -gradiente como respaldo para que Wolfe pueda funcionar.
+    """
+    start = time.perf_counter()
+    x = x0.astype(float).copy()
+    rows = []
+    stop_reason = "Máximo número de iteraciones alcanzado."
+
+    for k in range(max_iter + 1):
+        fx = f(x)
+        g = grad(x)
+        H = hess(x)
+        error = float(np.linalg.norm(g, ord=2))
+
+        rows.append({
+            "iteracion": k,
+            "f(x)": fx,
+            "error_norma_gradiente": error,
+            "alpha": np.nan,
+            "direccion": "",
+            "criterio": "Evaluación inicial" if k == 0 else "",
+            **{f"x{i+1}": x[i] for i in range(len(x))}
+        })
+
+        if error <= tol:
+            stop_reason = "Convergencia: norma del gradiente menor o igual a la tolerancia."
+            break
+
+        if k == max_iter:
+            break
+
+        direction_label = "Newton"
+
+        try:
+            p = np.linalg.solve(H, -g)
+        except np.linalg.LinAlgError:
+            p = -g
+            direction_label = "Gradiente por Hessiana singular"
+
+        if not np.all(np.isfinite(p)) or float(np.dot(g, p)) >= 0:
+            p = -g
+            direction_label = "Gradiente por dirección Newton no descendente"
+
+        alpha, ls_msg = wolfe_line_search(f, grad, x, p, c1, c2, alpha0=alpha0)
+
+        if alpha <= EPS:
+            stop_reason = "Parada: la búsqueda de línea no encontró un paso útil."
+            rows[-1]["criterio"] = ls_msg
+            rows[-1]["direccion"] = direction_label
+            break
+
+        x = x + alpha * p
+        rows[-1]["alpha"] = alpha
+        rows[-1]["direccion"] = direction_label
+        rows[-1]["criterio"] = ls_msg
+
+    elapsed = time.perf_counter() - start
+    history = pd.DataFrame(rows)
+
+    return OptimizationResult(
+        method="Newton globalizado",
+        x_star=x,
+        f_star=f(x),
+        iterations=len(history) - 1,
+        final_error=float(np.linalg.norm(grad(x), ord=2)),
+        stop_reason=stop_reason,
+        elapsed_time=elapsed,
+        history=history,
+    )
+
+
+# ============================================================
+# Visualizaciones
+# ============================================================
+
+def plot_convergence(history: pd.DataFrame):
+    """Gráfico error vs iteraciones en escala logarítmica."""
+    fig, ax = plt.subplots()
+    errors = history["error_norma_gradiente"].to_numpy(dtype=float)
+    errors = np.maximum(errors, EPS)
+
+    ax.plot(history["iteracion"], errors, marker="o")
+    ax.set_yscale("log")
+    ax.set_xlabel("Número de iteración")
+    ax.set_ylabel("Error: ||∇f(x)||₂")
+    ax.set_title("Convergencia del método")
+    ax.grid(True, which="both", linestyle="--", linewidth=0.5)
+
+    return fig
+
+
+def plot_1d_function(f: Callable[[np.ndarray], float], x_star: np.ndarray):
+    """Visualización simple para funciones de una variable."""
+    center = float(x_star[0])
+    xs = np.linspace(center - 5, center + 5, 300)
+    ys = []
+
+    for value in xs:
+        try:
+            ys.append(f(np.array([value], dtype=float)))
+        except Exception:
+            ys.append(np.nan)
+
+    fig, ax = plt.subplots()
+    ax.plot(xs, ys)
+    ax.scatter([center], [f(x_star)], s=60)
+    ax.set_xlabel("x1")
+    ax.set_ylabel("f(x1)")
+    ax.set_title("Visualización 1D alrededor del mínimo encontrado")
+    ax.grid(True, linestyle="--", linewidth=0.5)
+
+    return fig
+
+
+def plot_2d_contour(f: Callable[[np.ndarray], float], history: pd.DataFrame):
+    """Curvas de nivel para funciones de dos variables."""
+    x_values = history["x1"].to_numpy(dtype=float)
+    y_values = history["x2"].to_numpy(dtype=float)
+
+    x_min, x_max = np.min(x_values), np.max(x_values)
+    y_min, y_max = np.min(y_values), np.max(y_values)
+
+    # Margen para que la trayectoria no quede pegada al borde.
+    margin_x = max(1.0, 0.3 * (x_max - x_min + EPS))
+    margin_y = max(1.0, 0.3 * (y_max - y_min + EPS))
+
+    x_grid = np.linspace(x_min - margin_x, x_max + margin_x, 120)
+    y_grid = np.linspace(y_min - margin_y, y_max + margin_y, 120)
+    X, Y = np.meshgrid(x_grid, y_grid)
+    Z = np.empty_like(X)
+
+    for i in range(X.shape[0]):
+        for j in range(X.shape[1]):
+            try:
+                Z[i, j] = f(np.array([X[i, j], Y[i, j]], dtype=float))
+            except Exception:
+                Z[i, j] = np.nan
+
+    fig, ax = plt.subplots()
+    finite_z = Z[np.isfinite(Z)]
+
+    if finite_z.size > 0:
+        levels = 25
+        ax.contour(X, Y, Z, levels=levels)
+    else:
+        ax.text(0.5, 0.5, "No se pudo graficar la función en esta zona.", ha="center")
+
+    ax.plot(x_values, y_values, marker="o")
+    ax.scatter([x_values[-1]], [y_values[-1]], s=80)
+    ax.set_xlabel("x1")
+    ax.set_ylabel("x2")
+    ax.set_title("Curvas de nivel y trayectoria del algoritmo")
+    ax.grid(True, linestyle="--", linewidth=0.5)
+
+    return fig
+
+
+# ============================================================
+# Interfaz Streamlit
+# ============================================================
+
+st.title("📉 Optimizador multivariable con Condiciones de Wolfe")
+st.caption(
+    "Proyecto Final de Métodos de Optimización: Gradiente Descendente, "
+    "Gradiente Conjugado y Newton con búsqueda de línea Wolfe."
+)
+
+with st.sidebar:
+    st.header("Datos de entrada")
+
+    n = st.number_input(
+        "Número de variables",
+        min_value=1,
+        max_value=10,
+        value=2,
+        step=1,
+        help="La función debe usar variables x1, x2, ..., xn.",
+    )
+
+    method = st.selectbox(
+        "Método de optimización",
+        options=[
+            "Gradiente Descendente",
+            "Gradiente Conjugado",
+            "Newton",
+        ],
+    )
+
+    st.markdown("### Función objetivo")
+    example_by_n = {
+        1: "(x1-2)^2 + 1",
+        2: "(x1-1)^2 + 10*(x2-x1^2)^2",
+        3: "x1^2 + x2^2 + x3^2",
+    }
+    default_expr = example_by_n.get(int(n), " + ".join([f"x{i+1}^2" for i in range(int(n))]))
+
+    expr_text = st.text_area(
+        "f(x)",
+        value=default_expr,
+        height=100,
+        help="Usa x1, x2, ..., xn. Puedes escribir ^ o ** para potencias.",
+    )
+
+    x0_text = st.text_input(
+        "Punto de partida",
+        value=", ".join(["0"] * int(n)),
+        help="Valores separados por comas. Ejemplo para 2 variables: 2, -1",
+    )
+
+    max_iter = st.number_input(
+        "Número máximo de iteraciones",
+        min_value=1,
+        max_value=10000,
+        value=200,
+        step=10,
+    )
+
+    tol = st.number_input(
+        "Tolerancia de convergencia",
+        min_value=1e-12,
+        max_value=1.0,
+        value=1e-6,
+        step=1e-6,
+        format="%.12f",
+    )
+
+    st.markdown("### Parámetros Wolfe")
+    c1 = st.number_input(
+        "c1 Armijo",
+        min_value=1e-8,
+        max_value=0.49,
+        value=1e-4,
+        format="%.8f",
+        help="Valor típico: 1e-4. Debe cumplir 0 < c1 < c2 < 1.",
+    )
+
+    c2 = st.number_input(
+        "c2 Curvatura",
+        min_value=0.01,
+        max_value=0.99,
+        value=0.90,
+        format="%.4f",
+        help="Valores típicos: 0.9 para Newton/Gradiente; 0.1 a 0.9 para CG.",
+    )
+
+    alpha0 = st.number_input(
+        "Alpha inicial",
+        min_value=1e-8,
+        max_value=100.0,
+        value=1.0,
+        format="%.8f",
+    )
+
+    calculate = st.button("Calcular", type="primary")
+
+
+with st.expander("Ayuda rápida: cómo escribir funciones"):
+    st.markdown(
+        """
+        **Variables:** `x1`, `x2`, ..., `xn`.
+
+        **Operaciones válidas:**
+        - Potencias: `x1^2` o `x1**2`
+        - Exponencial: `exp(x1)`
+        - Logaritmo natural: `ln(x1)` o `log(x1)`
+        - Trigonométricas: `sin(x1)`, `cos(x2)`, `tan(x1)`
+
+        **Ejemplos:**
+        - Cuadrática 2D: `(x1-3)^2 + (x2+1)^2`
+        - Rosenbrock: `(x1-1)^2 + 10*(x2-x1^2)^2`
+        - Logarítmica: `ln(x1^2+x2^2)-2*x1*x2`
+
+        **Advertencia:** si la función tiene logaritmos, raíces o divisiones, el punto inicial y la trayectoria deben estar dentro del dominio.
+        """
+    )
+
+
+if calculate:
+    try:
+        if not (0 < c1 < c2 < 1):
+            st.error("Los parámetros Wolfe deben cumplir: 0 < c1 < c2 < 1.")
+            st.stop()
+
+        n_int = int(n)
+        x0 = parse_initial_point(x0_text, n_int)
+        expr, variables, f, grad, hess = build_sympy_functions(expr_text, n_int)
+
+        st.subheader("Función interpretada")
+        st.latex(r"f(" + ",".join([str(v) for v in variables]) + r") = " + sp.latex(expr))
+
+        if method == "Gradiente Descendente":
+            result = gradient_descent(f, grad, x0, int(max_iter), float(tol), float(c1), float(c2), float(alpha0))
+        elif method == "Gradiente Conjugado":
+            result = conjugate_gradient_fr(f, grad, x0, int(max_iter), float(tol), float(c1), float(c2), float(alpha0))
+        else:
+            result = newton_method(f, grad, hess, x0, int(max_iter), float(tol), float(c1), float(c2), float(alpha0))
+
+        st.success("Cálculo finalizado.")
+
+        # Resultados esperados
+        st.subheader("Resultados esperados")
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Método", result.method)
+        col2.metric("Iteraciones", result.iterations)
+        col3.metric("Tiempo de ejecución", f"{result.elapsed_time:.6f} s")
+
+        col4, col5 = st.columns(2)
+        col4.metric("Valor f(x*)", f"{result.f_star:.10g}")
+        col5.metric("Error final ||∇f(x*)||₂", f"{result.final_error:.3e}")
+
+        st.markdown(f"**Punto mínimo encontrado:** `{format_vector(result.x_star)}`")
+        st.markdown(f"**Criterio de parada alcanzado:** {result.stop_reason}")
+
+        st.subheader("Gráfico de convergencia")
+        st.pyplot(plot_convergence(result.history))
+
+        st.subheader("Valor agregado: tabla de iteraciones")
+        st.dataframe(result.history, use_container_width=True)
+
+        csv = result.history.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Descargar historial en CSV",
+            data=csv,
+            file_name="historial_optimizacion.csv",
+            mime="text/csv",
+        )
+
+        if n_int == 1:
+            st.subheader("Valor agregado: visualización de la función")
+            st.pyplot(plot_1d_function(f, result.x_star))
+        elif n_int == 2:
+            st.subheader("Valor agregado: curvas de nivel y trayectoria")
+            st.pyplot(plot_2d_contour(f, result.history))
+        else:
+            st.info("Para n > 2 se muestra la convergencia y la tabla de iteraciones. Las curvas de nivel solo aplican para n = 2.")
+
+        with st.expander("Detalles matemáticos usados"):
+            st.markdown(
+                r"""
+                **Error final:** se calcula como la norma euclidiana del gradiente:
+                \[
+                error_k = \|\nabla f(x_k)\|_2
+                \]
+
+                **Condición de Armijo:**
+                \[
+                f(x_k+\alpha_k p_k) \leq f(x_k) + c_1 \alpha_k \nabla f(x_k)^T p_k
+                \]
+
+                **Condición de curvatura de Wolfe:**
+                \[
+                \nabla f(x_k+\alpha_k p_k)^T p_k \geq c_2 \nabla f(x_k)^T p_k
+                \]
+
+                **Direcciones usadas:**
+                - Gradiente Descendente:
+                \[
+                p_k = -\nabla f(x_k)
+                \]
+                - Gradiente Conjugado Fletcher-Reeves:
+                \[
+                p_{k+1} = -g_{k+1} + \beta_k p_k,\quad
+                \beta_k = \frac{g_{k+1}^Tg_{k+1}}{g_k^Tg_k}
+                \]
+                - Newton:
+                \[
+                \nabla^2 f(x_k)p_k = -\nabla f(x_k)
+                \]
+
+                En Newton, si la Hessiana es singular o la dirección no es de descenso, se usa temporalmente la dirección de máximo descenso para mantener la búsqueda Wolfe válida.
+                """
+            )
+
+    except Exception as exc:
+        st.error("No se pudo ejecutar el algoritmo.")
+        st.exception(exc)
+
+else:
+    st.info("Completa los datos en el panel lateral y presiona **Calcular**.")
+
+    st.markdown(
+        """
+        ### Qué entrega esta aplicación
+
+        - Punto mínimo encontrado.
+        - Valor de la función objetivo en ese punto.
+        - Número de iteraciones realizadas.
+        - Error final usando norma del gradiente.
+        - Criterio de parada.
+        - Gráfico de convergencia en escala logarítmica.
+        - Tabla de iteraciones.
+        - Visualización adicional para funciones de 1 o 2 variables.
+        """
+    )
