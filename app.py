@@ -789,41 +789,55 @@ if calculate:
         else:
             st.info("Para n > 2 se muestra la convergencia y la tabla de iteraciones. Las curvas de nivel solo aplican para n = 2.")
 
-        with st.expander("Detalles matemáticos usados"):
+        with st.expander("Detalles matemáticos usados", expanded=False):
+            st.markdown("### Fundamento matemático del algoritmo")
             st.markdown(
-                r"""
-                **Error final:** se calcula como la norma euclidiana del gradiente:
-                \[
-                error_k = \|\nabla f(x_k)\|_2
-                \]
+                "Esta sección muestra las fórmulas usadas por la aplicación en notación matemática "
+                "para que el procedimiento sea trazable y defendible."
+            )
 
-                **Condición de Armijo:**
-                \[
-                f(x_k+\alpha_k p_k) \leq f(x_k) + c_1 \alpha_k \nabla f(x_k)^T p_k
-                \]
+            st.markdown("#### 1. Actualización iterativa")
+            st.latex(r"x_{k+1}=x_k+\alpha_k p_k")
+            st.markdown(
+                "- $x_k$: punto actual.\n"
+                "- $p_k$: dirección de búsqueda.\n"
+                "- $\alpha_k$: tamaño de paso obtenido mediante búsqueda de línea."
+            )
 
-                **Condición de curvatura de Wolfe:**
-                \[
-                \nabla f(x_k+\alpha_k p_k)^T p_k \geq c_2 \nabla f(x_k)^T p_k
-                \]
+            st.markdown("#### 2. Error final o criterio de convergencia")
+            st.latex(r"e_k=\|\nabla f(x_k)\|_2")
+            st.markdown(
+                "El algoritmo se considera convergente cuando la norma euclidiana del gradiente "
+                "es menor o igual que la tolerancia definida por el usuario."
+            )
 
-                **Direcciones usadas:**
-                - Gradiente Descendente:
-                \[
-                p_k = -\nabla f(x_k)
-                \]
-                - Gradiente Conjugado Fletcher-Reeves:
-                \[
-                p_{k+1} = -g_{k+1} + \beta_k p_k,\quad
-                \beta_k = \frac{g_{k+1}^Tg_{k+1}}{g_k^Tg_k}
-                \]
-                - Newton:
-                \[
-                \nabla^2 f(x_k)p_k = -\nabla f(x_k)
-                \]
+            st.markdown("#### 3. Condiciones de Wolfe")
+            st.markdown("**Primera condición de Wolfe / Armijo:**")
+            st.latex(r"f(x_k+\alpha_k p_k)\leq f(x_k)+c_1\alpha_k\nabla f(x_k)^T p_k")
 
-                En Newton, si la Hessiana es singular o la dirección no es de descenso, se usa temporalmente la dirección de máximo descenso para mantener la búsqueda Wolfe válida.
-                """
+            st.markdown("**Segunda condición de Wolfe / condición de curvatura:**")
+            st.latex(r"\nabla f(x_k+\alpha_k p_k)^T p_k\geq c_2\nabla f(x_k)^T p_k")
+
+            st.markdown(
+                "Estas condiciones controlan que el paso $\alpha_k$ produzca una disminución "
+                "suficiente de la función objetivo y que la dirección mantenga una curvatura aceptable."
+            )
+
+            st.markdown("#### 4. Direcciones de búsqueda usadas")
+
+            st.markdown("**Gradiente Descendente:**")
+            st.latex(r"p_k=-\nabla f(x_k)")
+
+            st.markdown("**Gradiente Conjugado no lineal Fletcher-Reeves:**")
+            st.latex(r"p_{k+1}=-g_{k+1}+\beta_k p_k")
+            st.latex(r"\beta_k=\frac{g_{k+1}^Tg_{k+1}}{g_k^Tg_k}")
+
+            st.markdown("**Método de Newton:**")
+            st.latex(r"\nabla^2 f(x_k)p_k=-\nabla f(x_k)")
+            st.markdown(
+                "En Newton, si la Hessiana es singular o la dirección calculada no es de descenso, "
+                "la aplicación usa temporalmente la dirección de máximo descenso para mantener válida "
+                "la búsqueda de línea con Wolfe."
             )
 
     except Exception as exc:
