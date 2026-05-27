@@ -273,6 +273,42 @@ def wolfe_line_search(
     return alpha, "Búsqueda de línea alcanzó el máximo de iteraciones."
 
 
+def verify_wolfe_conditions(
+    f: Callable[[np.ndarray], float],
+    grad: Callable[[np.ndarray], np.ndarray],
+    x: np.ndarray,
+    p: np.ndarray,
+    alpha: float,
+    c1: float,
+    c2: float,
+) -> Tuple[bool, bool, float, float]:
+    """
+    Verifica explícitamente las dos condiciones de Wolfe para el paso aceptado.
+
+    Retorna:
+    - Armijo satisfecho: bool
+    - Curvatura satisfecha: bool
+    - grad(x_k)^T p_k
+    - grad(x_k + alpha p_k)^T p_k
+    """
+    if alpha <= EPS:
+        return False, False, np.nan, np.nan
+
+    f0 = f(x)
+    g0 = grad(x)
+    derphi0 = float(np.dot(g0, p))
+    x_next = x + alpha * p
+    f_next = f(x_next)
+    g_next = grad(x_next)
+    derphi_next = float(np.dot(g_next, p))
+
+    armijo_rhs = f0 + c1 * alpha * derphi0
+    armijo_ok = bool(f_next <= armijo_rhs + 1e-10)
+    curvature_ok = bool(derphi_next >= c2 * derphi0 - 1e-10)
+
+    return armijo_ok, curvature_ok, derphi0, derphi_next
+
+
 # ============================================================
 # Algoritmos de optimización
 # ============================================================
@@ -303,6 +339,10 @@ def gradient_descent(
             "f(x)": fx,
             "error_norma_gradiente": error,
             "alpha": np.nan,
+            "Wolfe Armijo": "",
+            "Wolfe Curvatura": "",
+            "grad(x)^T p": np.nan,
+            "grad(x+alpha*p)^T p": np.nan,
             "criterio": "Evaluación inicial" if k == 0 else "",
             **{f"x{i+1}": x[i] for i in range(len(x))}
         })
@@ -316,6 +356,11 @@ def gradient_descent(
 
         p = -g
         alpha, ls_msg = wolfe_line_search(f, grad, x, p, c1, c2, alpha0=alpha0)
+        armijo_ok, curvature_ok, derphi0, derphi_next = verify_wolfe_conditions(f, grad, x, p, alpha, c1, c2)
+        rows[-1]["Wolfe Armijo"] = "Sí" if armijo_ok else "No"
+        rows[-1]["Wolfe Curvatura"] = "Sí" if curvature_ok else "No"
+        rows[-1]["grad(x)^T p"] = derphi0
+        rows[-1]["grad(x+alpha*p)^T p"] = derphi_next
 
         if alpha <= EPS:
             stop_reason = "Parada: la búsqueda de línea no encontró un paso útil."
@@ -376,6 +421,10 @@ def conjugate_gradient_fr(
             "error_norma_gradiente": error,
             "alpha": np.nan,
             "beta_FR": np.nan,
+            "Wolfe Armijo": "",
+            "Wolfe Curvatura": "",
+            "grad(x)^T p": np.nan,
+            "grad(x+alpha*p)^T p": np.nan,
             "criterio": "Evaluación inicial" if k == 0 else "",
             **{f"x{i+1}": x[i] for i in range(len(x))}
         })
@@ -392,6 +441,11 @@ def conjugate_gradient_fr(
             rows[-1]["criterio"] = "Reinicio: dirección no descendente."
 
         alpha, ls_msg = wolfe_line_search(f, grad, x, p, c1, c2, alpha0=alpha0)
+        armijo_ok, curvature_ok, derphi0, derphi_next = verify_wolfe_conditions(f, grad, x, p, alpha, c1, c2)
+        rows[-1]["Wolfe Armijo"] = "Sí" if armijo_ok else "No"
+        rows[-1]["Wolfe Curvatura"] = "Sí" if curvature_ok else "No"
+        rows[-1]["grad(x)^T p"] = derphi0
+        rows[-1]["grad(x+alpha*p)^T p"] = derphi_next
 
         if alpha <= EPS:
             stop_reason = "Parada: la búsqueda de línea no encontró un paso útil."
@@ -472,6 +526,10 @@ def newton_method(
             "error_norma_gradiente": error,
             "alpha": np.nan,
             "direccion": "",
+            "Wolfe Armijo": "",
+            "Wolfe Curvatura": "",
+            "grad(x)^T p": np.nan,
+            "grad(x+alpha*p)^T p": np.nan,
             "criterio": "Evaluación inicial" if k == 0 else "",
             **{f"x{i+1}": x[i] for i in range(len(x))}
         })
@@ -496,6 +554,11 @@ def newton_method(
             direction_label = "Gradiente por dirección Newton no descendente"
 
         alpha, ls_msg = wolfe_line_search(f, grad, x, p, c1, c2, alpha0=alpha0)
+        armijo_ok, curvature_ok, derphi0, derphi_next = verify_wolfe_conditions(f, grad, x, p, alpha, c1, c2)
+        rows[-1]["Wolfe Armijo"] = "Sí" if armijo_ok else "No"
+        rows[-1]["Wolfe Curvatura"] = "Sí" if curvature_ok else "No"
+        rows[-1]["grad(x)^T p"] = derphi0
+        rows[-1]["grad(x+alpha*p)^T p"] = derphi_next
 
         if alpha <= EPS:
             stop_reason = "Parada: la búsqueda de línea no encontró un paso útil."
@@ -521,6 +584,33 @@ def newton_method(
         elapsed_time=elapsed,
         history=history,
     )
+
+
+def run_selected_method(
+    method_name: str,
+    f: Callable[[np.ndarray], float],
+    grad: Callable[[np.ndarray], np.ndarray],
+    hess: Callable[[np.ndarray], np.ndarray],
+    x0: np.ndarray,
+    max_iter: int,
+    tol: float,
+    c1: float,
+    c2: float,
+    alpha0: float,
+) -> OptimizationResult:
+    """Ejecuta un método a partir de su nombre en la interfaz."""
+    if method_name == "Gradiente Descendente":
+        return gradient_descent(f, grad, x0, max_iter, tol, c1, c2, alpha0)
+    if method_name == "Gradiente Conjugado":
+        return conjugate_gradient_fr(f, grad, x0, max_iter, tol, c1, c2, alpha0)
+    if method_name == "Newton":
+        return newton_method(f, grad, hess, x0, max_iter, tol, c1, c2, alpha0)
+    raise ValueError(f"Método no reconocido: {method_name}")
+
+
+def choose_best_result(results: List[OptimizationResult]) -> OptimizationResult:
+    """Escoge el resultado más robusto priorizando menor error y luego menor f(x*)."""
+    return min(results, key=lambda r: (r.final_error, r.f_star, r.iterations, r.elapsed_time))
 
 
 # ============================================================
@@ -609,6 +699,251 @@ def plot_2d_contour(f: Callable[[np.ndarray], float], history: pd.DataFrame):
     return fig
 
 
+def plot_comparison_convergence(results: List[OptimizationResult]):
+    """Compara la convergencia de varios métodos en un mismo gráfico."""
+    fig, ax = plt.subplots()
+
+    for result in results:
+        hist = result.history
+        errors = hist["error_norma_gradiente"].to_numpy(dtype=float)
+        errors = np.maximum(errors, EPS)
+        ax.plot(hist["iteracion"], errors, marker="o", label=result.method)
+
+    ax.set_yscale("log")
+    ax.set_xlabel("Número de iteración")
+    ax.set_ylabel("Error: ||∇f(x)||₂")
+    ax.set_title("Comparación de convergencia entre métodos")
+    ax.grid(True, which="both", linestyle="--", linewidth=0.5)
+    ax.legend()
+
+    return fig
+
+
+def comparison_dataframe(results: List[OptimizationResult]) -> pd.DataFrame:
+    """Tabla resumen para comparar desempeño de los métodos."""
+    rows = []
+    for result in results:
+        rows.append({
+            "Método": result.method,
+            "x*": format_vector(result.x_star, decimals=6),
+            "f(x*)": result.f_star,
+            "Iteraciones": result.iterations,
+            "Error final ||∇f||₂": result.final_error,
+            "Tiempo [s]": result.elapsed_time,
+            "Criterio de parada": result.stop_reason,
+        })
+    return pd.DataFrame(rows)
+
+
+def hessian_diagnostic(grad: Callable[[np.ndarray], np.ndarray], hess: Callable[[np.ndarray], np.ndarray], x_star: np.ndarray, tol: float) -> Dict[str, object]:
+    """Evalúa gradiente, Hessiana y autovalores en el punto encontrado."""
+    g_star = grad(x_star)
+    H_star = hess(x_star)
+    H_sym = 0.5 * (H_star + H_star.T)
+    eigvals = np.linalg.eigvalsh(H_sym)
+    grad_norm = float(np.linalg.norm(g_star, ord=2))
+
+    eig_tol = max(1e-8, 100 * tol)
+    if np.all(eigvals > eig_tol):
+        hess_class = "Definida positiva"
+        conclusion = "El punto encontrado cumple condición de segundo orden suficiente: mínimo local estricto."
+    elif np.all(eigvals >= -eig_tol):
+        hess_class = "Semidefinida positiva"
+        conclusion = "El punto es compatible con mínimo local, pero la Hessiana semidefinida no garantiza mínimo estricto."
+    elif np.all(eigvals < -eig_tol):
+        hess_class = "Definida negativa"
+        conclusion = "La Hessiana sugiere máximo local, no mínimo. Revisa función o punto inicial."
+    else:
+        hess_class = "Indefinida"
+        conclusion = "La Hessiana sugiere punto silla o región no convexa; el punto no puede certificarse como mínimo local estricto."
+
+    if grad_norm > max(tol, 1e-6) * 10:
+        conclusion += " Además, la norma del gradiente no quedó suficientemente baja, por lo que conviene aumentar iteraciones o revisar parámetros."
+
+    return {
+        "gradiente": g_star,
+        "norma_gradiente": grad_norm,
+        "hessiana": H_star,
+        "autovalores": eigvals,
+        "clasificacion_hessiana": hess_class,
+        "conclusion": conclusion,
+    }
+
+
+def show_hessian_diagnostic(result: OptimizationResult, grad: Callable[[np.ndarray], np.ndarray], hess: Callable[[np.ndarray], np.ndarray], tol: float):
+    """Muestra diagnóstico matemático del resultado."""
+    st.subheader("Valor agregado: diagnóstico matemático del punto encontrado")
+
+    try:
+        diag = hessian_diagnostic(grad, hess, result.x_star, tol)
+        c1_diag, c2_diag, c3_diag = st.columns(3)
+        c1_diag.metric("Norma del gradiente", f"{diag['norma_gradiente']:.3e}")
+        c2_diag.metric("Clasificación Hessiana", str(diag["clasificacion_hessiana"]))
+        c3_diag.metric("Autovalor mínimo", f"{np.min(diag['autovalores']):.3e}")
+
+        st.markdown(f"**Conclusión:** {diag['conclusion']}")
+
+        with st.expander("Ver gradiente, Hessiana y autovalores"):
+            st.markdown("**Gradiente evaluado en el punto encontrado:**")
+            st.code(np.array2string(diag["gradiente"], precision=6, suppress_small=True))
+
+            st.markdown("**Hessiana evaluada en el punto encontrado:**")
+            st.dataframe(pd.DataFrame(diag["hessiana"]), use_container_width=True)
+
+            st.markdown("**Autovalores de la Hessiana:**")
+            st.code(np.array2string(diag["autovalores"], precision=6, suppress_small=True))
+    except Exception as exc:
+        st.warning("No se pudo construir el diagnóstico de Hessiana para esta función/punto.")
+        st.exception(exc)
+
+
+def build_execution_report(expr_text: str, variables: List[sp.Symbol], result: OptimizationResult, c1: float, c2: float, alpha0: float, tol: float) -> str:
+    """Genera un resumen descargable de la ejecución."""
+    lines = [
+        "INFORME DE EJECUCIÓN - OPTIMIZADOR CON CONDICIONES DE WOLFE",
+        "",
+        f"Función objetivo: {expr_text}",
+        f"Variables: {', '.join(str(v) for v in variables)}",
+        f"Método: {result.method}",
+        f"Punto mínimo encontrado: {format_vector(result.x_star)}",
+        f"Valor f(x*): {result.f_star:.12g}",
+        f"Iteraciones realizadas: {result.iterations}",
+        f"Error final ||grad f(x*)||_2: {result.final_error:.6e}",
+        f"Tiempo de ejecución [s]: {result.elapsed_time:.6f}",
+        f"Criterio de parada: {result.stop_reason}",
+        "",
+        "Parámetros Wolfe:",
+        f"c1 Armijo: {c1}",
+        f"c2 Curvatura: {c2}",
+        f"Alpha inicial: {alpha0}",
+        f"Tolerancia: {tol}",
+        "",
+        "Últimas iteraciones:",
+        result.history.tail(10).to_string(index=False),
+    ]
+    return "\n".join(lines)
+
+
+def show_math_details():
+    """Sección de fundamentos matemáticos en LaTeX."""
+    with st.expander("Detalles matemáticos usados", expanded=False):
+        st.markdown("### Fundamento matemático del algoritmo")
+        st.markdown(
+            "Esta sección muestra las fórmulas usadas por la aplicación en notación matemática "
+            "para que el procedimiento sea trazable y defendible."
+        )
+
+        st.markdown("#### 1. Actualización iterativa")
+        st.latex(r"x_{k+1}=x_k+\alpha_k p_k")
+        st.markdown(
+            "- $x_k$: punto actual.\n"
+            "- $p_k$: dirección de búsqueda.\n"
+            "- $\alpha_k$: tamaño de paso obtenido mediante búsqueda de línea."
+        )
+
+        st.markdown("#### 2. Error final o criterio de convergencia")
+        st.latex(r"e_k=\|\nabla f(x_k)\|_2")
+        st.markdown(
+            "El algoritmo se considera convergente cuando la norma euclidiana del gradiente "
+            "es menor o igual que la tolerancia definida por el usuario."
+        )
+
+        st.markdown("#### 3. Condiciones de Wolfe")
+        st.markdown("**Primera condición de Wolfe / Armijo:**")
+        st.latex(r"f(x_k+\alpha_k p_k)\leq f(x_k)+c_1\alpha_k\nabla f(x_k)^T p_k")
+
+        st.markdown("**Segunda condición de Wolfe / condición de curvatura:**")
+        st.latex(r"\nabla f(x_k+\alpha_k p_k)^T p_k\geq c_2\nabla f(x_k)^T p_k")
+
+        st.markdown(
+            "Estas condiciones controlan que el paso $\alpha_k$ produzca una disminución "
+            "suficiente de la función objetivo y que la dirección mantenga una curvatura aceptable."
+        )
+
+        st.markdown("#### 4. Direcciones de búsqueda usadas")
+        st.markdown("**Gradiente Descendente:**")
+        st.latex(r"p_k=-\nabla f(x_k)")
+
+        st.markdown("**Gradiente Conjugado no lineal Fletcher-Reeves:**")
+        st.latex(r"p_{k+1}=-g_{k+1}+\beta_k p_k")
+        st.latex(r"\beta_k=\frac{g_{k+1}^Tg_{k+1}}{g_k^Tg_k}")
+
+        st.markdown("**Método de Newton:**")
+        st.latex(r"\nabla^2 f(x_k)p_k=-\nabla f(x_k)")
+        st.markdown(
+            "En Newton, si la Hessiana es singular o la dirección calculada no es de descenso, "
+            "la aplicación usa temporalmente la dirección de máximo descenso para mantener válida "
+            "la búsqueda de línea con Wolfe."
+        )
+
+
+def display_single_result(
+    result: OptimizationResult,
+    f: Callable[[np.ndarray], float],
+    grad: Callable[[np.ndarray], np.ndarray],
+    hess: Callable[[np.ndarray], np.ndarray],
+    n_int: int,
+    expr_text: str,
+    variables: List[sp.Symbol],
+    c1: float,
+    c2: float,
+    alpha0: float,
+    tol: float,
+    show_visuals: bool = True,
+):
+    """Renderiza resultados completos de un método."""
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Método", result.method)
+    col2.metric("Iteraciones", result.iterations)
+    col3.metric("Tiempo de ejecución", f"{result.elapsed_time:.6f} s")
+
+    col4, col5 = st.columns(2)
+    col4.metric("Valor f(x*)", f"{result.f_star:.10g}")
+    col5.metric("Error final ||∇f(x*)||₂", f"{result.final_error:.3e}")
+
+    st.markdown(f"**Punto mínimo encontrado:** `{format_vector(result.x_star)}`")
+    st.markdown(f"**Criterio de parada alcanzado:** {result.stop_reason}")
+
+    show_hessian_diagnostic(result, grad, hess, tol)
+
+    st.subheader("Gráfico de convergencia")
+    st.pyplot(plot_convergence(result.history))
+
+    st.subheader("Valor agregado: tabla de iteraciones con verificación Wolfe")
+    st.caption("Las columnas Wolfe muestran si el paso aceptado cumple Armijo y curvatura en cada iteración.")
+    st.dataframe(result.history, use_container_width=True)
+
+    csv = result.history.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Descargar historial en CSV",
+        data=csv,
+        file_name=f"historial_{result.method.lower().replace(' ', '_')}.csv",
+        mime="text/csv",
+        key=f"download_historial_{result.method}",
+    )
+
+    report = build_execution_report(expr_text, variables, result, c1, c2, alpha0, tol).encode("utf-8")
+    st.download_button(
+        "Descargar informe de ejecución TXT",
+        data=report,
+        file_name=f"informe_ejecucion_{result.method.lower().replace(' ', '_')}.txt",
+        mime="text/plain",
+        key=f"informe_txt_{result.method}_{show_visuals}_{result.iterations}",
+    )
+
+    if show_visuals:
+        if n_int == 1:
+            st.subheader("Valor agregado: visualización de la función")
+            st.pyplot(plot_1d_function(f, result.x_star))
+        elif n_int == 2:
+            st.subheader("Valor agregado: curvas de nivel y trayectoria")
+            st.pyplot(plot_2d_contour(f, result.history))
+        else:
+            st.info("Para n > 2 se muestra la convergencia, la tabla de iteraciones, la verificación Wolfe y el diagnóstico de Hessiana. Las curvas de nivel solo aplican para n = 2.")
+
+    show_math_details()
+
+
 # ============================================================
 # Interfaz Streamlit
 # ============================================================
@@ -638,6 +973,12 @@ with st.sidebar:
             "Gradiente Conjugado",
             "Newton",
         ],
+    )
+
+    compare_methods = st.checkbox(
+        "Valor agregado: comparar automáticamente los 3 métodos",
+        value=False,
+        help="Ejecuta Gradiente Descendente, Gradiente Conjugado y Newton con la misma función, punto inicial y tolerancia.",
     )
 
     st.markdown("### Función objetivo")
@@ -742,102 +1083,106 @@ if calculate:
         st.subheader("Función interpretada")
         st.latex(r"f(" + ",".join([str(v) for v in variables]) + r") = " + sp.latex(expr))
 
-        if method == "Gradiente Descendente":
-            result = gradient_descent(f, grad, x0, int(max_iter), float(tol), float(c1), float(c2), float(alpha0))
-        elif method == "Gradiente Conjugado":
-            result = conjugate_gradient_fr(f, grad, x0, int(max_iter), float(tol), float(c1), float(c2), float(alpha0))
+        if compare_methods:
+            st.success("Cálculo comparativo finalizado.")
+            method_names = ["Gradiente Descendente", "Gradiente Conjugado", "Newton"]
+            results = [
+                run_selected_method(
+                    name,
+                    f,
+                    grad,
+                    hess,
+                    x0,
+                    int(max_iter),
+                    float(tol),
+                    float(c1),
+                    float(c2),
+                    float(alpha0),
+                )
+                for name in method_names
+            ]
+
+            best_result = choose_best_result(results)
+
+            st.subheader("Valor agregado: comparación automática de métodos")
+            st.markdown(
+                "La aplicación ejecuta los tres algoritmos con los mismos datos de entrada y permite comparar "
+                "iteraciones, error final, valor objetivo y tiempo de ejecución."
+            )
+
+            comp_df = comparison_dataframe(results)
+            st.dataframe(comp_df, use_container_width=True)
+
+            comp_csv = comp_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Descargar comparación en CSV",
+                data=comp_csv,
+                file_name="comparacion_metodos.csv",
+                mime="text/csv",
+                key="download_comparacion_metodos",
+            )
+
+            st.markdown(
+                f"**Método recomendado por menor error final:** `{best_result.method}` "
+                f"con error `{best_result.final_error:.3e}` y `{best_result.iterations}` iteraciones."
+            )
+
+            st.subheader("Gráfico comparativo de convergencia")
+            st.pyplot(plot_comparison_convergence(results))
+
+            st.subheader("Detalle por método")
+            tabs = st.tabs([r.method for r in results])
+            for tab, result in zip(tabs, results):
+                with tab:
+                    display_single_result(
+                        result,
+                        f,
+                        grad,
+                        hess,
+                        n_int,
+                        expr_text,
+                        variables,
+                        float(c1),
+                        float(c2),
+                        float(alpha0),
+                        float(tol),
+                        show_visuals=False,
+                    )
+
+            st.info(
+                "Lectura sugerida: Newton suele converger en menos iteraciones cuando la Hessiana es estable; "
+                "Gradiente Descendente suele ser más lento pero robusto; Gradiente Conjugado suele quedar en un punto intermedio."
+            )
+
         else:
-            result = newton_method(f, grad, hess, x0, int(max_iter), float(tol), float(c1), float(c2), float(alpha0))
-
-        st.success("Cálculo finalizado.")
-
-        # Resultados esperados
-        st.subheader("Resultados esperados")
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Método", result.method)
-        col2.metric("Iteraciones", result.iterations)
-        col3.metric("Tiempo de ejecución", f"{result.elapsed_time:.6f} s")
-
-        col4, col5 = st.columns(2)
-        col4.metric("Valor f(x*)", f"{result.f_star:.10g}")
-        col5.metric("Error final ||∇f(x*)||₂", f"{result.final_error:.3e}")
-
-        st.markdown(f"**Punto mínimo encontrado:** `{format_vector(result.x_star)}`")
-        st.markdown(f"**Criterio de parada alcanzado:** {result.stop_reason}")
-
-        st.subheader("Gráfico de convergencia")
-        st.pyplot(plot_convergence(result.history))
-
-        st.subheader("Valor agregado: tabla de iteraciones")
-        st.dataframe(result.history, use_container_width=True)
-
-        csv = result.history.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Descargar historial en CSV",
-            data=csv,
-            file_name="historial_optimizacion.csv",
-            mime="text/csv",
-        )
-
-        if n_int == 1:
-            st.subheader("Valor agregado: visualización de la función")
-            st.pyplot(plot_1d_function(f, result.x_star))
-        elif n_int == 2:
-            st.subheader("Valor agregado: curvas de nivel y trayectoria")
-            st.pyplot(plot_2d_contour(f, result.history))
-        else:
-            st.info("Para n > 2 se muestra la convergencia y la tabla de iteraciones. Las curvas de nivel solo aplican para n = 2.")
-
-        with st.expander("Detalles matemáticos usados", expanded=False):
-            st.markdown("### Fundamento matemático del algoritmo")
-            st.markdown(
-                "Esta sección muestra las fórmulas usadas por la aplicación en notación matemática "
-                "para que el procedimiento sea trazable y defendible."
+            result = run_selected_method(
+                method,
+                f,
+                grad,
+                hess,
+                x0,
+                int(max_iter),
+                float(tol),
+                float(c1),
+                float(c2),
+                float(alpha0),
             )
 
-            st.markdown("#### 1. Actualización iterativa")
-            st.latex(r"x_{k+1}=x_k+\alpha_k p_k")
-            st.markdown(
-                "- $x_k$: punto actual.\n"
-                "- $p_k$: dirección de búsqueda.\n"
-                "- $\alpha_k$: tamaño de paso obtenido mediante búsqueda de línea."
-            )
-
-            st.markdown("#### 2. Error final o criterio de convergencia")
-            st.latex(r"e_k=\|\nabla f(x_k)\|_2")
-            st.markdown(
-                "El algoritmo se considera convergente cuando la norma euclidiana del gradiente "
-                "es menor o igual que la tolerancia definida por el usuario."
-            )
-
-            st.markdown("#### 3. Condiciones de Wolfe")
-            st.markdown("**Primera condición de Wolfe / Armijo:**")
-            st.latex(r"f(x_k+\alpha_k p_k)\leq f(x_k)+c_1\alpha_k\nabla f(x_k)^T p_k")
-
-            st.markdown("**Segunda condición de Wolfe / condición de curvatura:**")
-            st.latex(r"\nabla f(x_k+\alpha_k p_k)^T p_k\geq c_2\nabla f(x_k)^T p_k")
-
-            st.markdown(
-                "Estas condiciones controlan que el paso $\alpha_k$ produzca una disminución "
-                "suficiente de la función objetivo y que la dirección mantenga una curvatura aceptable."
-            )
-
-            st.markdown("#### 4. Direcciones de búsqueda usadas")
-
-            st.markdown("**Gradiente Descendente:**")
-            st.latex(r"p_k=-\nabla f(x_k)")
-
-            st.markdown("**Gradiente Conjugado no lineal Fletcher-Reeves:**")
-            st.latex(r"p_{k+1}=-g_{k+1}+\beta_k p_k")
-            st.latex(r"\beta_k=\frac{g_{k+1}^Tg_{k+1}}{g_k^Tg_k}")
-
-            st.markdown("**Método de Newton:**")
-            st.latex(r"\nabla^2 f(x_k)p_k=-\nabla f(x_k)")
-            st.markdown(
-                "En Newton, si la Hessiana es singular o la dirección calculada no es de descenso, "
-                "la aplicación usa temporalmente la dirección de máximo descenso para mantener válida "
-                "la búsqueda de línea con Wolfe."
+            st.success("Cálculo finalizado.")
+            st.subheader("Resultados esperados")
+            display_single_result(
+                result,
+                f,
+                grad,
+                hess,
+                n_int,
+                expr_text,
+                variables,
+                float(c1),
+                float(c2),
+                float(alpha0),
+                float(tol),
+                show_visuals=True,
             )
 
     except Exception as exc:
@@ -857,7 +1202,10 @@ else:
         - Error final usando norma del gradiente.
         - Criterio de parada.
         - Gráfico de convergencia en escala logarítmica.
-        - Tabla de iteraciones.
+        - Tabla de iteraciones con verificación explícita de Wolfe.
+        - Comparación automática entre los tres métodos.
+        - Diagnóstico de Hessiana, autovalores y clasificación del punto encontrado.
+        - Informe descargable de ejecución.
         - Visualización adicional para funciones de 1 o 2 variables.
         """
     )
